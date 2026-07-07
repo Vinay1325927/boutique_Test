@@ -1,5 +1,6 @@
 import streamlit as st
 from pymongo import MongoClient
+import certifi
 import pandas as pd
 from datetime import date, datetime, timedelta
 import plotly.express as px
@@ -985,11 +986,21 @@ def get_mongo_client():
         if not uri:
             st.error("⚠️ MONGO_URI not configured.")
             st.stop()
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        client = MongoClient(
+            uri,
+            serverSelectionTimeoutMS=5000,
+            tls=True,
+            tlsCAFile=certifi.where(),
+        )
         client.admin.command("ping")
         return client
     except Exception as e:
         st.error(f"MongoDB connection failed: {e}")
+        st.info(
+            "If this persists, check: (1) Atlas → Network Access allows 0.0.0.0/0, "
+            "(2) your MONGO_URI is correct in Secrets, and (3) pymongo/dnspython/certifi "
+            "are up to date in requirements.txt."
+        )
         st.stop()
 
 def get_db():
