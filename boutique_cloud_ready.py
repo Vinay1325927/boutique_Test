@@ -1,6 +1,5 @@
 import streamlit as st
 from pymongo import MongoClient
-import certifi
 import pandas as pd
 from datetime import date, datetime, timedelta
 import plotly.express as px
@@ -986,21 +985,11 @@ def get_mongo_client():
         if not uri:
             st.error("⚠️ MONGO_URI not configured.")
             st.stop()
-        client = MongoClient(
-            uri,
-            serverSelectionTimeoutMS=5000,
-            tls=True,
-            tlsCAFile=certifi.where(),
-        )
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
         client.admin.command("ping")
         return client
     except Exception as e:
         st.error(f"MongoDB connection failed: {e}")
-        st.info(
-            "If this persists, check: (1) Atlas → Network Access allows 0.0.0.0/0, "
-            "(2) your MONGO_URI is correct in Secrets, and (3) pymongo/dnspython/certifi "
-            "are up to date in requirements.txt."
-        )
         st.stop()
 
 def get_db():
@@ -1196,6 +1185,18 @@ def currency_input(label: str, key: str, value: float | None = None) -> tuple[st
     parsed, valid = parse_currency(raw)
     return raw, parsed, valid
 
+def clean_text_cell(value) -> str:
+    text = str(value or "").strip()
+    return "" if text in ("—", "None", "NaT", "nan") else text
+
+def date_cell_to_iso(value, required: bool = False) -> tuple[str, bool]:
+    if value is None or str(value) in ("", "NaT", "nan", "None"):
+        return "", not required
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return "", False
+    return str(parsed.date()), True
+
 def default_receiver_name() -> str:
     return str(st.session_state.get("username") or "Admin").strip().title()
 
@@ -1243,6 +1244,293 @@ def record_payment(row: pd.Series, payment_amount: float, payment_date: date, pa
     invalidate_cache()
     status = "Payment completed." if new_pending == 0 else f"Partial payment saved. ₹{new_pending:,.2f} still pending."
     return True, status
+
+def save_account_editor_changes(original_df: pd.DataFrame, edited_df: pd.DataFrame) -> tuple[int, list[str]]:
+    originals = original_df.set_index("id", drop=False)
+    changed = 0
+    errors = []
+
+    for _, row in edited_df.iterrows():
+        try:
+            row_id = int(row["ID"])
+        except (TypeError, ValueError):
+            errors.append("One edited row has an invalid ID.")
+            continue
+        if row_id not in originals.index:
+            errors.append(f"Sale #{row_id} was not found.")
+            continue
+
+        sale_date, sale_date_ok = date_cell_to_iso(row.get("Date"), required=True)
+        paid_date, paid_date_ok = date_cell_to_iso(row.get("Paid Date"), required=False)
+        buy = round(money_value(row.get("Buy ₹")), 2)
+        sell = round(money_value(row.get("Sell ₹")), 2)
+        paid = round(money_value(row.get("Paid ₹")), 2)
+        if not sale_date_ok:
+            errors.append(f"Sale #{row_id}: enter a valid sale date.")
+            continue
+        if not paid_date_ok:
+            errors.append(f"Sale #{row_id}: enter a valid paid date or leave it blank.")
+            continue
+        if buy < 0 or sell < 0 or paid < 0:
+            errors.append(f"Sale #{row_id}: amounts cannot be negative.")
+            continue
+        if paid > sell:
+            errors.append(f"Sale #{row_id}: paid amount cannot exceed selling price.")
+            continue
+
+        pending = round(max(sell - paid, 0.0), 2)
+        set_fields = {
+            "customer_name": clean_text_cell(row.get("Customer"))[:120],
+            "customer_phone": normalize_phone(row.get("Phone")),
+            "sale_date": sale_date,
+            "vendor": clean_text_cell(row.get("Vendor"))[:100],
+            "product_category": clean_text_cell(row.get("Category")) or CATEGORIES[0],
+            "buying_price": buy,
+            "selling_price": sell,
+            "amount_paid": paid,
+            "pending_amount": pending,
+            "payment_received": 1 if pending == 0 else 0,
+            "payment_method": clean_text_cell(row.get("Sale Method")) or PAYMENT_METHODS[0],
+            "last_payment_method": clean_text_cell(row.get("Paid Method")),
+            "last_payment_date": paid_date,
+            "last_payment_received_by": clean_text_cell(row.get("Received By"))[:80],
+            "payment_date": paid_date if pending == 0 else "",
+            "updated_at": str(datetime.now()),
+        }
+        if set_fields["product_category"] not in CATEGORIES:
+            errors.append(f"Sale #{row_id}: choose a valid category.")
+            continue
+        if set_fields["payment_method"] not in PAYMENT_METHODS:
+            errors.append(f"Sale #{row_id}: choose a valid sale method.")
+            continue
+        if set_fields["last_payment_method"] and set_fields["last_payment_method"] not in PAYMENT_COLLECTION_METHODS:
+            errors.append(f"Sale #{row_id}: choose a valid paid method.")
+            continue
+
+        current = originals.loc[row_id]
+        comparable = {
+            "customer_name": str(current.get("customer_name", "") or "").strip()[:120],
+            "customer_phone": normalize_phone(current.get("customer_phone", "")),
+            "sale_date": date_cell_to_iso(current.get("sale_date"), required=False)[0],
+            "vendor": str(current.get("vendor", "") or "").strip()[:100],
+            "product_category": str(current.get("product_category", "") or "").strip(),
+            "buying_price": round(money_value(current.get("buying_price")), 2),
+            "selling_price": round(money_value(current.get("selling_price")), 2),
+            "amount_paid": round(money_value(current.get("amount_paid")), 2),
+            "pending_amount": round(money_value(current.get("pending_amount")), 2),
+            "payment_received": int(money_value(current.get("payment_received"))),
+            "payment_method": str(current.get("payment_method", "") or "").strip(),
+            "last_payment_method": str(current.get("last_payment_method", "") or "").strip(),
+            "last_payment_date": date_cell_to_iso(current.get("last_payment_date"), required=False)[0],
+            "last_payment_received_by": str(current.get("last_payment_received_by", "") or "").strip()[:80],
+            "payment_date": date_cell_to_iso(current.get("payment_date"), required=False)[0] if pending == 0 else "",
+        }
+        if any(set_fields[field] != comparable.get(field) for field in comparable):
+            get_col().update_one({"id": row_id}, {"$set": set_fields})
+            changed += 1
+
+    if changed:
+        invalidate_cache()
+    return changed, errors
+
+def bill_file_name(customer_name: str) -> str:
+    safe_name = re.sub(r"[^0-9A-Za-z]+", "_", str(customer_name or "customer")).strip("_").lower()
+    return f"bill_{safe_name or 'customer'}_{date.today()}.pdf"
+
+def get_customer_bill_data(df: pd.DataFrame, customer_name: str) -> pd.DataFrame:
+    if df.empty or not customer_name:
+        return pd.DataFrame()
+    mask = df["customer_name"].astype(str).str.casefold().eq(str(customer_name).casefold())
+    return df[mask].sort_values(["sale_date", "id"], ascending=[True, True]).copy()
+
+def bill_status(row: pd.Series) -> str:
+    pending = money_value(row.get("pending_amount"))
+    return "PAID [x]" if pending <= 0 else "PENDING"
+
+def bill_paid_date(row: pd.Series) -> str:
+    for field in ("last_payment_date", "payment_date"):
+        value = str(row.get(field, "") or "").strip()
+        if value:
+            parsed = pd.to_datetime(value, errors="coerce")
+            return parsed.strftime("%d %b %Y") if pd.notna(parsed) else value
+    return "-"
+
+def make_upi_qr_png(amount: float = 0.0) -> BytesIO:
+    try:
+        import qrcode
+    except ImportError as exc:
+        raise RuntimeError("Install qrcode[pil] to generate payment QR codes.") from exc
+
+    from urllib.parse import quote
+    upi_id = "9176619942@ybl"
+    uri = f"upi://pay?pa={quote(upi_id)}&pn={quote('Vinay Boutique')}&cu=INR"
+    if amount > 0:
+        uri += f"&am={amount:.2f}"
+    qr = qrcode.QRCode(box_size=8, border=2)
+    qr.add_data(uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    out = BytesIO()
+    img.save(out, format="PNG")
+    out.seek(0)
+    return out
+
+def generate_customer_bill_pdf(df: pd.DataFrame, customer_name: str, bill_date: date | None = None) -> BytesIO:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError as exc:
+        raise RuntimeError("Install reportlab to generate PDF bills.") from exc
+
+    bill_date = bill_date or date.today()
+    hist = get_customer_bill_data(df, customer_name)
+    if hist.empty:
+        raise ValueError("No purchases found for this customer.")
+
+    customer_phone = first_nonempty(hist.get("customer_phone", pd.Series(dtype=str)).tolist())
+    total_bill = float(hist["selling_price"].map(money_value).sum())
+    total_paid = float(hist["amount_paid"].map(money_value).sum())
+    total_pending = float(hist["pending_amount"].map(money_value).sum())
+
+    out = BytesIO()
+    doc = SimpleDocTemplate(
+        out,
+        pagesize=A4,
+        rightMargin=14 * mm,
+        leftMargin=14 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+        title=f"Bill - {customer_name}",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("BillTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=20, leading=24, textColor=colors.HexColor("#0F172A"), spaceAfter=4)
+    sub_style = ParagraphStyle("BillSub", parent=styles["Normal"], fontSize=9, leading=12, textColor=colors.HexColor("#475569"))
+    right_style = ParagraphStyle("Right", parent=styles["Normal"], fontSize=9, alignment=TA_RIGHT, textColor=colors.HexColor("#475569"))
+    center_style = ParagraphStyle("Center", parent=styles["Normal"], fontSize=9, alignment=TA_CENTER, textColor=colors.HexColor("#0F172A"))
+
+    story = []
+    header = Table(
+        [[
+            [Paragraph("Vinay Boutique", title_style), Paragraph("Customer Purchase Bill", sub_style)],
+            [Paragraph(f"<b>Bill Date:</b> {bill_date.strftime('%d %b %Y')}", right_style), Paragraph(f"<b>UPI:</b> 9176619942@ybl", right_style)],
+        ]],
+        colWidths=[112 * mm, 56 * mm],
+    )
+    header.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.6, colors.HexColor("#CBD5E1")),
+    ]))
+    story.append(header)
+    story.append(Spacer(1, 8))
+
+    customer_block = Table(
+        [[
+            Paragraph(f"<b>Customer:</b> {html_escape(str(customer_name))}", sub_style),
+            Paragraph(f"<b>Phone:</b> {html_escape(customer_phone or '-')}", sub_style),
+            Paragraph(f"<b>Total Purchases:</b> {len(hist)}", sub_style),
+        ]],
+        colWidths=[70 * mm, 48 * mm, 50 * mm],
+    )
+    customer_block.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#DBEAFE")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#E2E8F0")),
+        ("PADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.append(customer_block)
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("Bill Contents", ParagraphStyle("Section", parent=styles["Heading2"], fontSize=12, textColor=colors.HexColor("#0F172A"), spaceAfter=6)))
+
+    table_data = [["Date", "Item / Category", "Vendor", "Bill", "Paid", "Paid Date", "Status"]]
+    for _, row in hist.iterrows():
+        sale_dt = pd.to_datetime(row.get("sale_date"), errors="coerce")
+        date_text = sale_dt.strftime("%d %b %Y") if pd.notna(sale_dt) else "-"
+        desc = clean_text_cell(row.get("product_description")) or clean_text_cell(row.get("product_category")) or "-"
+        category = clean_text_cell(row.get("product_category"))
+        item = f"{html_escape(desc)}<br/><font color='#64748B'>{html_escape(category)}</font>"
+        table_data.append([
+            date_text,
+            Paragraph(item, sub_style),
+            clean_text_cell(row.get("vendor")) or "-",
+            f"Rs {money_value(row.get('selling_price')):,.2f}",
+            f"Rs {money_value(row.get('amount_paid')):,.2f}",
+            bill_paid_date(row),
+            bill_status(row),
+        ])
+
+    purchase_table = Table(table_data, colWidths=[22 * mm, 48 * mm, 28 * mm, 22 * mm, 22 * mm, 25 * mm, 22 * mm], repeatRows=1)
+    purchase_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF1FF")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#CBD5E1")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (3, 1), (4, -1), "RIGHT"),
+        ("ALIGN", (6, 1), (6, -1), "CENTER"),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
+        ("PADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(purchase_table)
+    story.append(Spacer(1, 10))
+
+    qr_buf = make_upi_qr_png(total_pending)
+    totals = Table(
+        [[
+            Image(qr_buf, width=34 * mm, height=34 * mm),
+            [
+                Paragraph("<b>PhonePe / UPI Payment</b>", sub_style),
+                Paragraph("UPI ID: 9176619942@ybl", sub_style),
+                Paragraph(f"QR amount: Rs {total_pending:,.2f}" if total_pending > 0 else "No pending amount", sub_style),
+            ],
+            [
+                Paragraph(f"<b>Total Bill:</b> Rs {total_bill:,.2f}", right_style),
+                Paragraph(f"<b>Total Paid:</b> Rs {total_paid:,.2f}", right_style),
+                Paragraph(f"<b>Total Pending:</b> Rs {total_pending:,.2f}", right_style),
+            ],
+        ]],
+        colWidths=[38 * mm, 62 * mm, 68 * mm],
+    )
+    totals.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#CBD5E1")),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("PADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(totals)
+    story.append(Spacer(1, 8))
+    if total_pending > 0:
+        story.append(Paragraph(f"Pending amount to be paid: <b>Rs {total_pending:,.2f}</b>", ParagraphStyle("Pending", parent=center_style, fontSize=10, textColor=colors.HexColor("#B91C1C"))))
+    else:
+        story.append(Paragraph("All listed purchases are paid.", ParagraphStyle("Paid", parent=center_style, fontSize=10, textColor=colors.HexColor("#047857"))))
+
+    doc.build(story)
+    out.seek(0)
+    return out
+
+def render_customer_bill_download(df: pd.DataFrame, customer_name: str, key: str, label: str = "Download Bill PDF", bill_date: date | None = None):
+    try:
+        bill_pdf = generate_customer_bill_pdf(df, customer_name, bill_date=bill_date or date.today())
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
+    except ValueError as exc:
+        st.info(str(exc))
+        return
+    st.download_button(
+        label,
+        data=bill_pdf,
+        file_name=bill_file_name(customer_name),
+        mime="application/pdf",
+        key=key,
+        use_container_width=True,
+    )
 
 def vendor_picker(label: str, key_prefix: str, current: str = "") -> str:
     current = str(current or "").strip()
@@ -1603,6 +1891,7 @@ def sidebar():
             "Customer List",
             "Analytics",
             "Reminders & Alerts",
+            "Generate Bill",
             "Backup & Restore",
             "Logout",
         ], label_visibility="collapsed")
@@ -1738,16 +2027,62 @@ def page_review():
     m5.metric("Avg Margin",   f"{fdf['margin'].mean():.1f}%" if not fdf.empty else "—")
     rule_sm()
 
-    show = fdf[["id","customer_name","customer_phone","sale_date","vendor","product_category","buying_price","selling_price","profit","amount_paid","pending_amount","payment_method","last_payment_method","last_payment_date","last_payment_received_by","delay_status","payment_received"]].copy()
-    show["sale_date"]        = show["sale_date"].dt.strftime("%d %b %Y")
-    show["vendor"] = show["vendor"].fillna("—").replace("", "—")
-    show["last_payment_method"] = show["last_payment_method"].fillna("—").replace("", "—")
-    show["last_payment_date"] = show["last_payment_date"].fillna("—").replace("", "—")
-    show["last_payment_received_by"] = show["last_payment_received_by"].fillna("—").replace("", "—")
-    show["delay_status"]     = show["delay_status"].map({0:"—", 1:"Yes"})
-    show["payment_received"] = show["payment_received"].map({0:"Pending", 1:"Paid"})
-    show.columns = ["ID","Customer","Phone","Date","Vendor","Category","Buy ₹","Sell ₹","Profit ₹","Paid ₹","Pending ₹","Sale Method","Paid Method","Paid Date","Received By","Delayed","Status"]
-    st.dataframe(show, use_container_width=True, hide_index=True)
+    save_message = st.session_state.pop("accounts_save_message", None)
+    if save_message:
+        st.success(save_message)
+
+    editor = fdf[["id","customer_name","customer_phone","sale_date","vendor","product_category","buying_price","selling_price","profit","amount_paid","pending_amount","payment_method","last_payment_method","last_payment_date","last_payment_received_by","payment_received"]].copy()
+    editor["ID"] = editor["id"].astype(int)
+    editor["Customer"] = editor["customer_name"].fillna("").astype(str)
+    editor["Phone"] = editor["customer_phone"].fillna("").astype(str)
+    editor["Date"] = editor["sale_date"].map(lambda value: pd.to_datetime(value, errors="coerce").date() if pd.notna(pd.to_datetime(value, errors="coerce")) else date.today())
+    editor["Vendor"] = editor["vendor"].fillna("").astype(str)
+    editor["Category"] = editor["product_category"].map(lambda value: value if value in CATEGORIES else CATEGORIES[0])
+    editor["Buy ₹"] = editor["buying_price"].map(money_value)
+    editor["Sell ₹"] = editor["selling_price"].map(money_value)
+    editor["Profit ₹"] = editor["profit"].map(money_value)
+    editor["Paid ₹"] = editor["amount_paid"].map(money_value)
+    editor["Pending ₹"] = editor["pending_amount"].map(money_value)
+    editor["Sale Method"] = editor["payment_method"].map(lambda value: value if value in PAYMENT_METHODS else PAYMENT_METHODS[0])
+    editor["Paid Method"] = editor["last_payment_method"].map(lambda value: value if value in PAYMENT_COLLECTION_METHODS else "")
+    editor["Paid Date"] = editor["last_payment_date"].map(lambda value: pd.to_datetime(value, errors="coerce").date() if pd.notna(pd.to_datetime(value, errors="coerce")) else None)
+    editor["Received By"] = editor["last_payment_received_by"].fillna("").astype(str)
+    editor["Status"] = editor["payment_received"].map({0:"Pending", 1:"Paid"}).fillna("Pending")
+    editor = editor[["ID","Customer","Phone","Date","Vendor","Category","Buy ₹","Sell ₹","Profit ₹","Paid ₹","Pending ₹","Sale Method","Paid Method","Paid Date","Received By","Status"]]
+
+    edited_accounts = st.data_editor(
+        editor,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["ID", "Profit ₹", "Pending ₹", "Status"],
+        column_config={
+            "ID": st.column_config.NumberColumn("ID", disabled=True),
+            "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD", required=True),
+            "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES, required=True),
+            "Buy ₹": st.column_config.NumberColumn("Buy ₹", min_value=0.0, step=100.0, format="₹ %.2f"),
+            "Sell ₹": st.column_config.NumberColumn("Sell ₹", min_value=0.0, step=100.0, format="₹ %.2f"),
+            "Profit ₹": st.column_config.NumberColumn("Profit ₹", disabled=True, format="₹ %.2f"),
+            "Paid ₹": st.column_config.NumberColumn("Paid ₹", min_value=0.0, step=100.0, format="₹ %.2f"),
+            "Pending ₹": st.column_config.NumberColumn("Pending ₹", disabled=True, format="₹ %.2f"),
+            "Sale Method": st.column_config.SelectboxColumn("Sale Method", options=PAYMENT_METHODS, required=True),
+            "Paid Method": st.column_config.SelectboxColumn("Paid Method", options=[""] + PAYMENT_COLLECTION_METHODS),
+            "Paid Date": st.column_config.DateColumn("Paid Date", format="YYYY-MM-DD"),
+            "Status": st.column_config.TextColumn("Status", disabled=True),
+        },
+        key="accounts_inline_editor",
+    )
+    save_edit_col, _ = st.columns([1, 3])
+    with save_edit_col:
+        if st.button("Save Edited Rows", use_container_width=True):
+            changed, errors = save_account_editor_changes(fdf, edited_accounts)
+            for err in errors:
+                st.error(err)
+            if changed:
+                st.session_state.accounts_save_message = f"Saved {changed} edited row(s)."
+                st.rerun()
+            elif not errors:
+                st.info("No edited rows to save.")
 
     dc, de, _ = st.columns([1,1,2])
     with dc:
@@ -2019,6 +2354,54 @@ def page_customers():
             styled_fig(fig, 230); st.plotly_chart(fig, use_container_width=True)
 
 
+def page_generate_bill():
+    page_header("Generate Bill", "Customer PDF Statement")
+    df = fetch_all()
+    if df.empty:
+        st.info("No sales available to bill.")
+        return
+
+    customers = sorted([c for c in df["customer_name"].dropna().astype(str).unique() if c.strip()], key=str.casefold)
+    if not customers:
+        st.info("No customers found.")
+        return
+
+    def customer_label(name: str) -> str:
+        hist = get_customer_bill_data(df, name)
+        pending = float(hist["pending_amount"].map(money_value).sum()) if not hist.empty else 0.0
+        total = float(hist["selling_price"].map(money_value).sum()) if not hist.empty else 0.0
+        return f"{name} — Pending ₹{pending:,.0f} / Total ₹{total:,.0f}"
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        selected = st.selectbox("Customer", customers, format_func=customer_label, key="bill_customer")
+    with c2:
+        bill_dt = st.date_input("Bill Date", value=date.today(), key="bill_date")
+
+    hist = get_customer_bill_data(df, selected)
+    total_bill = float(hist["selling_price"].map(money_value).sum())
+    total_paid = float(hist["amount_paid"].map(money_value).sum())
+    total_pending = float(hist["pending_amount"].map(money_value).sum())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Purchases", len(hist))
+    m2.metric("Total Bill", f"₹{total_bill:,.0f}")
+    m3.metric("Paid", f"₹{total_paid:,.0f}")
+    m4.metric("Pending", f"₹{total_pending:,.0f}")
+
+    rule_sm()
+    preview = hist[["sale_date","product_category","product_description","vendor","selling_price","amount_paid","pending_amount","last_payment_date"]].copy()
+    preview["sale_date"] = preview["sale_date"].dt.strftime("%d %b %Y")
+    preview["status"] = hist.apply(bill_status, axis=1)
+    preview["last_payment_date"] = hist.apply(bill_paid_date, axis=1)
+    preview.columns = ["Date","Category","Description","Vendor","Bill ₹","Paid ₹","Pending ₹","Paid Date","Status"]
+    st.dataframe(preview, use_container_width=True, hide_index=True)
+
+    dc, _ = st.columns([1, 3])
+    with dc:
+        render_customer_bill_download(df, selected, key=f"bill_page_download_{re.sub(r'[^0-9A-Za-z]+', '_', selected)}", label="Generate Bill PDF", bill_date=bill_dt)
+
+
 def page_analytics():
     page_header("Analytics", "Business Intelligence")
     df = fetch_all()
@@ -2182,7 +2565,7 @@ def page_reminders():
             for _, r in ov.iterrows():
                 with st.expander(f"{r['customer_name']}  ·  ₹{r['pending_amount']:,.0f}  ·  {int(r['days_old'])} days"):
                     row_id = int(r["id"])
-                    ca, cb, cc, cd = st.columns([2,2,1,1])
+                    ca, cb, cc, cd, ce = st.columns([2,2,1,1,1])
                     ca.write(r["sale_date"].strftime("%d %b %Y"))
                     cb.write(r.get("product_category","—"))
                     with cc:
@@ -2192,6 +2575,8 @@ def page_reminders():
                     with cd:
                         if st.button("Remind", key=f"or_{row_id}", use_container_width=True):
                             st.toast(f"Reminder noted for {r['customer_name']}.")
+                    with ce:
+                        render_customer_bill_download(df, r["customer_name"], key=f"overdue_bill_{row_id}", label="Bill PDF")
                     if st.session_state.get("overdue_payment_editor_id") == row_id:
                         st.markdown("<div class='pay-form-note'>Enter full or partial payment details.</div>", unsafe_allow_html=True)
                         with st.form(f"overdue_payment_form_{row_id}"):
@@ -2260,6 +2645,13 @@ def page_reminders():
             show["sale_date"] = show["sale_date"].dt.strftime("%d %b %Y")
             show.columns = ["Customer","Phone","Date","Category","Pending ₹","Days Old"]
             st.dataframe(show, use_container_width=True, hide_index=True)
+            sec("Bill PDFs")
+            for customer in sorted(soon["customer_name"].dropna().astype(str).unique(), key=str.casefold):
+                c1, c2 = st.columns([3, 1])
+                pending_total = float(df[df["customer_name"].astype(str).eq(customer)]["pending_amount"].map(money_value).sum())
+                c1.write(f"**{customer}** · ₹{pending_total:,.2f} pending")
+                with c2:
+                    render_customer_bill_download(df, customer, key=f"upcoming_bill_{re.sub(r'[^0-9A-Za-z]+', '_', customer)}", label="Bill PDF")
 
 
 def page_inventory():
@@ -2627,6 +3019,7 @@ def main():
     elif "Customer"    in page: page_customers()
     elif "Analytics"   in page: page_analytics()
     elif "Reminders"   in page: page_reminders()
+    elif "Generate Bill" in page: page_generate_bill()
     elif "Backup"      in page: page_backup_restore()
     elif "Logout"      in page:
         st.session_state.logged_in = False
