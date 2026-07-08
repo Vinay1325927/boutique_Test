@@ -7,3 +7,6 @@ python-dotenv
 openpyxl
 reportlab
 qrcode[pil]
+pdfplumber
+pypdf
+
